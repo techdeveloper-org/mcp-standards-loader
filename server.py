@@ -22,8 +22,12 @@ Tools (6):
 """
 
 import json
+import os
+import re
 import sys
+import time
 from pathlib import Path
+from typing import Annotated, Optional
 
 # Ensure src/mcp/ is in path for base package imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -35,6 +39,8 @@ try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 from base.response import to_json
 from base.decorators import mcp_tool_handler
 
@@ -43,12 +49,66 @@ mcp = MCPServer(
     instructions="Project type detection and coding standards loading with conflict resolution"
 )
 
-# Paths
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-POLICIES_DIR = _PROJECT_ROOT / "policies"
-ARCH_STANDARDS_DIR = _PROJECT_ROOT / "scripts" / "architecture" / "02-standards-system"
-TEAM_STANDARDS_DIR = Path.home() / ".claude" / "policies" / "02-standards-system"
-TEAM_STANDARDS_ALT = Path.home() / ".claude" / "standards"
+# This repository's directory and the workspace holding it alongside siblings.
+_REPO_DIR = Path(__file__).resolve().parent
+_WORKSPACE_ROOT = _REPO_DIR.parent
+
+
+def _env_dir(var_name: str, default: Path) -> Path:
+    """Resolve a directory from an environment variable, falling back to a default.
+
+    Args:
+        var_name: Environment variable holding an override path.
+        default: Path used when the variable is unset or empty.
+
+    Returns:
+        The resolved Path, with ~ expanded.
+    """
+    raw = os.environ.get(var_name)
+    if raw:
+        return Path(raw).expanduser()
+    return default
+
+
+def _resolve_arch_standards_dir() -> Optional[Path]:
+    """Locate the built-in framework/language standards directory.
+
+    Resolution order: CLAUDE_ARCHITECTURE_DIR/02-standards-system, then any
+    sibling repository in the workspace exposing
+    scripts/architecture/02-standards-system.
+
+    Returns:
+        The directory Path, or None when no candidate exists on disk.
+    """
+    override = os.environ.get("CLAUDE_ARCHITECTURE_DIR")
+    if override:
+        candidate = Path(override).expanduser() / "02-standards-system"
+        return candidate if candidate.is_dir() else None
+
+    try:
+        children = sorted(_WORKSPACE_ROOT.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        candidate = child / "scripts" / "architecture" / "02-standards-system"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+# Paths. Every location is env-overridable and defaults under the Claude home
+# directory, matching the path contract the rest of the fleet uses. The previous
+# constants were anchored to this repository's grandparent directory, which has
+# not held policies/ or scripts/ since the servers were split into sibling repos.
+CLAUDE_HOME = _env_dir("CLAUDE_HOME", Path.home() / ".claude")
+POLICIES_DIR = _env_dir("CLAUDE_POLICIES_DIR", CLAUDE_HOME / "policies")
+ARCH_STANDARDS_DIR = _resolve_arch_standards_dir()
+TEAM_STANDARDS_DIR = POLICIES_DIR / "02-standards-system"
+TEAM_STANDARDS_ALT = CLAUDE_HOME / "standards"
+# Global rule files. CLAUDE_STANDARDS_DIR is documented in this server's
+# CLAUDE.md but was previously never read, so ~/.claude/rules was invisible to
+# every load even though it holds the active coding standards.
+RULES_DIR = _env_dir("CLAUDE_STANDARDS_DIR", CLAUDE_HOME / "rules")
 
 # Priority constants
 PRIORITY_CUSTOM = 4
@@ -56,14 +116,49 @@ PRIORITY_TEAM = 3
 PRIORITY_FRAMEWORK = 2
 PRIORITY_LANGUAGE = 1
 
+# Read-only annotation: every tool here inspects the filesystem and in-process
+# cache without mutating any user-visible state.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+
+# Rule extraction pattern, compiled once rather than per standards file.
+_RULE_PATTERN = re.compile(r'-\s+\*\*(\w[\w\s-]*)\*\*\s*:\s*(.+)')
+
+
+def _has_any(root: Path, pattern: str) -> bool:
+    """Test whether at least one path under root matches a glob pattern.
+
+    Short-circuits on the first match. The previous form materialized the entire
+    recursive match list before slicing it, so a single existence test walked the
+    whole project tree.
+
+    Args:
+        root: Directory to search.
+        pattern: Glob pattern, may be recursive.
+
+    Returns:
+        True when at least one match exists.
+    """
+    try:
+        return next(root.glob(pattern), None) is not None
+    except OSError:
+        return False
+
 
 # =============================================================================
 # TOOL 1: DETECT PROJECT TYPE
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def detect_project_type(project_path: str = ".") -> str:
+def detect_project_type(
+    project_path: Annotated[str, Field(
+        description="Filesystem path to the project root to inspect. Defaults to the current working directory.")] = ".",
+) -> str:
     """Detect the primary programming language of a project.
 
     Checks marker files: setup.py, pom.xml, package.json, tsconfig.json,
@@ -97,13 +192,13 @@ def detect_project_type(project_path: str = ".") -> str:
         elif (root / "Cargo.toml").exists():
             lang = "rust"
         # C#
-        elif list(root.glob("**/*.csproj"))[:1] or list(root.glob("**/*.sln"))[:1]:
+        elif _has_any(root, "**/*.csproj") or _has_any(root, "**/*.sln"):
             lang = "csharp"
         # Swift
-        elif (root / "Package.swift").exists() or list(root.glob("**/*.xcodeproj"))[:1]:
+        elif (root / "Package.swift").exists() or _has_any(root, "**/*.xcodeproj"):
             lang = "swift"
         # Kotlin
-        elif list(root.glob("**/*.kt"))[:1]:
+        elif _has_any(root, "**/*.kt"):
             lang = "kotlin"
         else:
             lang = "unknown"
@@ -121,9 +216,14 @@ def detect_project_type(project_path: str = ".") -> str:
 # TOOL 2: DETECT FRAMEWORK
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def detect_framework(project_path: str = ".", project_type: str = "") -> str:
+def detect_framework(
+    project_path: Annotated[str, Field(
+        description="Filesystem path to the project root to inspect. Defaults to the current working directory.")] = ".",
+    project_type: Annotated[str, Field(
+        description="Detected language to scope framework detection to, e.g. 'python', 'java', 'typescript'. Auto-detected when empty.")] = "",
+) -> str:
     """Detect the primary framework within a project type.
 
     Args:
@@ -146,7 +246,7 @@ def detect_framework(project_path: str = ".", project_type: str = "") -> str:
         elif project_type in ("javascript", "typescript"):
             framework = _detect_js_fw(root)
         elif project_type == "swift":
-            framework = "swiftui" if list(root.rglob("*View.swift"))[:1] else "uikit"
+            framework = "swiftui" if _has_any(root, "**/*View.swift") else "uikit"
 
         return to_json({
             "success": True,
@@ -226,9 +326,12 @@ def _detect_js_fw(root: Path) -> str:
 # TOOL 3: LOAD STANDARDS
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def load_standards(project_path: str = ".") -> str:
+def load_standards(
+    project_path: Annotated[str, Field(
+        description="Filesystem path to the project root to inspect. Defaults to the current working directory.")] = ".",
+) -> str:
     """Load all applicable standards for a project with full traceability.
 
     Detection + loading pipeline:
@@ -243,7 +346,6 @@ def load_standards(project_path: str = ".") -> str:
         project_path: Path to project root
     """
     try:
-        import time
         root = Path(project_path).resolve()
 
         # Check cache freshness before full load
@@ -253,14 +355,9 @@ def load_standards(project_path: str = ".") -> str:
             age = time.time() - cached_ts
             if age < _STANDARDS_CACHE_TTL:
                 # Check if any watched dir has changed
-                dirs_changed = any(
-                    _check_standards_changed(d)
-                    for d in _get_watched_dirs()
-                    if Path(d).exists()
-                )
+                dirs_changed = _any_standards_changed()
                 if not dirs_changed:
-                    cached_data["from_cache"] = True
-                    return to_json(cached_data)
+                    return to_json({**cached_data, "from_cache": True})
 
         # Detect project
         pt_result = json.loads(detect_project_type(str(root)))
@@ -270,6 +367,9 @@ def load_standards(project_path: str = ".") -> str:
         framework = fw_result.get("framework", "unknown")
 
         all_standards = []
+        # Sources are loaded highest priority first and share one dedupe set, so
+        # a file reachable from two sources is kept at the higher priority only.
+        seen_files = set()
         traceability = {
             "project_type": project_type,
             "framework": framework,
@@ -279,7 +379,7 @@ def load_standards(project_path: str = ".") -> str:
         # 1. Custom standards (highest priority)
         custom = _load_from_dirs(
             [root / ".claude" / "standards", root / "standards"],
-            "custom", PRIORITY_CUSTOM
+            "custom", PRIORITY_CUSTOM, seen_files
         )
         all_standards.extend(custom)
         traceability["sources_checked"].append({
@@ -288,8 +388,8 @@ def load_standards(project_path: str = ".") -> str:
 
         # 2. Team standards
         team = _load_from_dirs(
-            [TEAM_STANDARDS_DIR, TEAM_STANDARDS_ALT],
-            "team", PRIORITY_TEAM
+            [RULES_DIR, TEAM_STANDARDS_DIR, TEAM_STANDARDS_ALT],
+            "team", PRIORITY_TEAM, seen_files
         )
         all_standards.extend(team)
         traceability["sources_checked"].append({
@@ -297,14 +397,14 @@ def load_standards(project_path: str = ".") -> str:
         })
 
         # 3. Framework standards
-        fw_standards = _load_framework_standards(project_type, framework)
+        fw_standards = _load_framework_standards(project_type, framework, seen_files)
         all_standards.extend(fw_standards)
         traceability["sources_checked"].append({
             "source": "framework", "priority": PRIORITY_FRAMEWORK, "loaded": len(fw_standards)
         })
 
         # 4. Language standards
-        lang_standards = _load_language_standards(project_type)
+        lang_standards = _load_language_standards(project_type, seen_files)
         all_standards.extend(lang_standards)
         traceability["sources_checked"].append({
             "source": "language", "priority": PRIORITY_LANGUAGE, "loaded": len(lang_standards)
@@ -334,7 +434,10 @@ def load_standards(project_path: str = ".") -> str:
             "from_cache": False,
         }
 
-        # Store in cache
+        # Store in cache and prime the mtime baseline. Without priming, the very
+        # first cache lookup has no baseline to compare against, reports every
+        # watched directory as changed, and discards the entry it just stored.
+        _any_standards_changed()
         _standards_cache[cache_key] = (result_data, time.time())
 
         return to_json(result_data)
@@ -342,35 +445,67 @@ def load_standards(project_path: str = ".") -> str:
         return to_json({"success": False, "error": str(e)})
 
 
-def _load_from_dirs(dirs, source, priority):
-    """Load .md standard files from directories."""
+def _load_from_dirs(dirs, source, priority, seen=None):
+    """Load .md standard files from directories, skipping already-loaded files.
+
+    Sources are loaded highest-priority first, so a file reachable from two
+    sources is kept only at the higher priority and is not double-counted in
+    standards_loaded or compared against itself in conflict detection.
+
+    Args:
+        dirs: Directories to scan recursively.
+        source: Source label recorded on each loaded standard.
+        priority: Priority value recorded on each loaded standard.
+        seen: Mutable set of already-loaded resolved paths, updated in place.
+
+    Returns:
+        List of standard dicts loaded from these directories.
+    """
     standards = []
+    if seen is None:
+        seen = set()
     for d in dirs:
-        if not d.exists():
+        if d is None or not d.exists():
             continue
         for md_file in sorted(d.rglob("*.md")):
             if md_file.name.lower() in ("readme.md", "changelog.md"):
                 continue
+            key = str(md_file.resolve()).lower()
+            if key in seen:
+                continue
             try:
                 content = md_file.read_text(encoding="utf-8", errors="ignore")
-                standards.append({
-                    "id": md_file.stem,
-                    "source": source,
-                    "priority": priority,
-                    "file": str(md_file),
-                    "content": content[:2000],  # First 2KB for rules extraction
-                    "size_bytes": md_file.stat().st_size,
-                    "rules": _extract_rules(content),
-                })
-            except Exception:
+                size_bytes = md_file.stat().st_size
+            except OSError:
                 continue
+            seen.add(key)
+            standards.append({
+                "id": md_file.stem,
+                "source": source,
+                "priority": priority,
+                "file": str(md_file),
+                "content": content[:2000],  # First 2KB for rules extraction
+                "size_bytes": size_bytes,
+                "rules": _extract_rules(content),
+            })
     return standards
 
 
-def _load_framework_standards(project_type, framework):
-    """Load built-in framework standards from architecture dir."""
+def _load_framework_standards(project_type, framework, seen=None):
+    """Load built-in framework standards from the architecture directory.
+
+    Args:
+        project_type: Detected language.
+        framework: Detected framework, or 'unknown' to load nothing.
+        seen: Mutable set of already-loaded resolved paths, updated in place.
+
+    Returns:
+        List of framework standard dicts.
+    """
     standards = []
-    if framework == "unknown":
+    if seen is None:
+        seen = set()
+    if framework == "unknown" or ARCH_STANDARDS_DIR is None:
         return standards
     patterns = [
         f"{project_type}-{framework}-standards.md",
@@ -379,34 +514,60 @@ def _load_framework_standards(project_type, framework):
     ]
     for pattern in patterns:
         for md_file in ARCH_STANDARDS_DIR.glob(pattern):
+            key = str(md_file.resolve()).lower()
+            if key in seen:
+                continue
             try:
                 content = md_file.read_text(encoding="utf-8", errors="ignore")
-                standards.append({
-                    "id": md_file.stem,
-                    "source": "framework",
-                    "priority": PRIORITY_FRAMEWORK,
-                    "file": str(md_file),
-                    "content": content[:2000],
-                    "rules": _extract_rules(content),
-                })
-            except Exception:
+            except OSError:
                 continue
+            seen.add(key)
+            standards.append({
+                "id": md_file.stem,
+                "source": "framework",
+                "priority": PRIORITY_FRAMEWORK,
+                "file": str(md_file),
+                "content": content[:2000],
+                "rules": _extract_rules(content),
+            })
     return standards
 
 
-def _load_language_standards(project_type):
-    """Load built-in language standards."""
+def _load_language_standards(project_type, seen=None):
+    """Load built-in language standards.
+
+    Scans the architecture standards directory for language-specific files and
+    then the policies standards directory. That directory is named
+    '02-standards-system'; the previous '02-standards' spelling matched nothing.
+
+    Args:
+        project_type: Detected language, or 'unknown' to load nothing.
+        seen: Mutable set of already-loaded resolved paths, updated in place.
+
+    Returns:
+        List of language standard dicts.
+    """
     standards = []
+    if seen is None:
+        seen = set()
     if project_type == "unknown":
         return standards
-    patterns = [
-        f"{project_type}-standards.md",
-        "common-standards-policy.md",
-    ]
-    for pattern in patterns:
-        for md_file in ARCH_STANDARDS_DIR.glob(pattern):
-            try:
-                content = md_file.read_text(encoding="utf-8", errors="ignore")
+
+    if ARCH_STANDARDS_DIR is not None:
+        patterns = [
+            f"{project_type}-standards.md",
+            "common-standards-policy.md",
+        ]
+        for pattern in patterns:
+            for md_file in ARCH_STANDARDS_DIR.glob(pattern):
+                key = str(md_file.resolve()).lower()
+                if key in seen:
+                    continue
+                try:
+                    content = md_file.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                seen.add(key)
                 standards.append({
                     "id": md_file.stem,
                     "source": "language",
@@ -415,35 +576,19 @@ def _load_language_standards(project_type):
                     "content": content[:2000],
                     "rules": _extract_rules(content),
                 })
-            except Exception:
-                continue
-    # Also check policies dir
-    policy_standards = POLICIES_DIR / "02-standards"
-    if policy_standards.exists():
-        for md_file in sorted(policy_standards.rglob("*.md")):
-            if md_file.name.lower() == "readme.md":
-                continue
-            try:
-                content = md_file.read_text(encoding="utf-8", errors="ignore")
-                standards.append({
-                    "id": md_file.stem,
-                    "source": "language",
-                    "priority": PRIORITY_LANGUAGE,
-                    "file": str(md_file),
-                    "content": content[:2000],
-                    "rules": _extract_rules(content),
-                })
-            except Exception:
-                continue
+
+    standards.extend(
+        _load_from_dirs([POLICIES_DIR / "02-standards-system"],
+                        "language", PRIORITY_LANGUAGE, seen)
+    )
     return standards
 
 
 def _extract_rules(content: str) -> dict:
     """Extract rule-like key-value pairs from markdown content."""
     rules = {}
-    import re
     # Match patterns like: - **rule_name**: value
-    for match in re.finditer(r'-\s+\*\*(\w[\w\s-]*)\*\*\s*:\s*(.+)', content):
+    for match in _RULE_PATTERN.finditer(content):
         key = match.group(1).strip().lower().replace(" ", "_").replace("-", "_")
         val = match.group(2).strip()
         rules[key] = val
@@ -483,9 +628,12 @@ def _resolve_conflicts(standards_list):
 # TOOL 4: RESOLVE CONFLICTS (standalone)
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def resolve_standard_conflicts(standards_json: str) -> str:
+def resolve_standard_conflicts(
+    standards_json: Annotated[str, Field(
+        description="JSON array string of standard objects, each with a 'rules' object and a numeric 'priority'. Higher priority wins on conflicting rule keys.")],
+) -> str:
     """Resolve conflicts in a list of standards (higher priority wins).
 
     Args:
@@ -509,9 +657,12 @@ def resolve_standard_conflicts(standards_json: str) -> str:
 # TOOL 5: GET ACTIVE STANDARDS
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def get_active_standards(project_path: str = ".") -> str:
+def get_active_standards(
+    project_path: Annotated[str, Field(
+        description="Filesystem path to the project root to inspect. Defaults to the current working directory.")] = ".",
+) -> str:
     """Get currently active standards summary for a project.
 
     Returns a lightweight summary without full content.
@@ -544,9 +695,12 @@ def get_active_standards(project_path: str = ".") -> str:
 # TOOL 6: LIST AVAILABLE STANDARDS
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def list_available_standards(source: str = "all") -> str:
+def list_available_standards(
+    source: Annotated[str, Field(
+        description="Source filter: 'all', 'team', 'framework', or 'language'.")] = "all",
+) -> str:
     """List all available standard files across all sources.
 
     Args:
@@ -554,47 +708,58 @@ def list_available_standards(source: str = "all") -> str:
     """
     try:
         standards = []
+        seen = set()
 
-        # Team standards
+        def _collect(dirs, label, priority):
+            """Append every non-README .md under dirs, skipping duplicates."""
+            for d in dirs:
+                if d is None or not d.exists():
+                    continue
+                for f in sorted(d.rglob("*.md")):
+                    if f.name.lower() == "readme.md":
+                        continue
+                    key = str(f.resolve()).lower()
+                    if key in seen:
+                        continue
+                    try:
+                        size_kb = round(f.stat().st_size / 1024, 1)
+                    except OSError:
+                        continue
+                    seen.add(key)
+                    standards.append({
+                        "id": f.stem, "source": label,
+                        "priority": priority, "file": str(f),
+                        "size_kb": size_kb,
+                    })
+
+        # Team standards, including the global rules directory.
         if source in ("all", "team"):
-            for d in [TEAM_STANDARDS_DIR, TEAM_STANDARDS_ALT]:
-                if d.exists():
-                    for f in sorted(d.rglob("*.md")):
-                        if f.name.lower() != "readme.md":
-                            standards.append({
-                                "id": f.stem, "source": "team",
-                                "priority": PRIORITY_TEAM, "file": str(f),
-                                "size_kb": round(f.stat().st_size / 1024, 1),
-                            })
+            _collect([RULES_DIR, TEAM_STANDARDS_DIR, TEAM_STANDARDS_ALT],
+                     "team", PRIORITY_TEAM)
 
-        # Architecture standards
+        # Architecture standards. ARCH_STANDARDS_DIR is None when no
+        # architecture directory exists in this installation.
         if source in ("all", "framework", "language"):
-            if ARCH_STANDARDS_DIR.exists():
-                for f in sorted(ARCH_STANDARDS_DIR.rglob("*.md")):
-                    if f.name.lower() != "readme.md":
-                        standards.append({
-                            "id": f.stem, "source": "architecture",
-                            "priority": PRIORITY_FRAMEWORK, "file": str(f),
-                            "size_kb": round(f.stat().st_size / 1024, 1),
-                        })
+            _collect([ARCH_STANDARDS_DIR], "architecture", PRIORITY_FRAMEWORK)
 
-        # Policy standards
+        # Policy standards. The directory is '02-standards-system'; the
+        # previous '02-standards' spelling matched nothing on disk.
         if source in ("all", "language"):
-            policy_dir = POLICIES_DIR / "02-standards"
-            if policy_dir.exists():
-                for f in sorted(policy_dir.rglob("*.md")):
-                    if f.name.lower() != "readme.md":
-                        standards.append({
-                            "id": f.stem, "source": "policy",
-                            "priority": PRIORITY_LANGUAGE, "file": str(f),
-                            "size_kb": round(f.stat().st_size / 1024, 1),
-                        })
+            _collect([POLICIES_DIR / "02-standards-system"],
+                     "policy", PRIORITY_LANGUAGE)
 
         return to_json({
             "success": True,
             "standards": standards,
             "count": len(standards),
             "source_filter": source,
+            "searched_dirs": {
+                "rules": str(RULES_DIR),
+                "team": str(TEAM_STANDARDS_DIR),
+                "team_alt": str(TEAM_STANDARDS_ALT),
+                "architecture": str(ARCH_STANDARDS_DIR) if ARCH_STANDARDS_DIR else None,
+                "policies": str(POLICIES_DIR / "02-standards-system"),
+            },
         })
     except Exception as e:
         return to_json({"success": False, "error": str(e)})
@@ -609,43 +774,69 @@ _standards_cache = {}   # {cache_key: (data, timestamp)}
 _cache_timestamp = 0
 _CACHE_TTL = 300  # 5 minutes default
 _STANDARDS_CACHE_TTL = 300  # 5 minutes
-_standards_mtimes = {}  # {file_path: last_mtime}
+_standards_mtimes = {}  # {watched_dir: {file_path: last_mtime}}
 _file_watcher_active = False
 
 
 def _check_standards_changed(standards_dir) -> bool:
-    """Check if any .md file in standards dir changed since last load.
-    Returns True if any file is new or modified.
+    """Check whether any .md file under a watched directory changed since last call.
+
+    Mtimes are tracked per watched directory. A single flat map shared across
+    directories made every call after the first report a change: scanning
+    directory B replaced directory A's recorded mtimes, so A's files looked new
+    on the next pass and B's looked deleted. That kept dirs_changed permanently
+    true and disabled the standards cache entirely.
+
+    Args:
+        standards_dir: Directory to scan recursively for .md files.
+
+    Returns:
+        True when a file under this directory is new, modified, or deleted
+        relative to the previous call for this same directory.
     """
-    changed = False
+    key = str(Path(standards_dir))
+    previous = _standards_mtimes.get(key, {})
     current = {}
+
     try:
         for md_file in Path(standards_dir).rglob("*.md"):
             try:
-                mtime = md_file.stat().st_mtime
-                current[str(md_file)] = mtime
-                if str(md_file) not in _standards_mtimes:
-                    changed = True  # New file
-                elif _standards_mtimes[str(md_file)] != mtime:
-                    changed = True  # Modified file
+                current[str(md_file)] = md_file.stat().st_mtime
             except OSError:
-                pass
-    except Exception:
+                continue
+    except OSError:
         pass
-    # Check for deleted files
-    for old_path in _standards_mtimes:
-        if old_path not in current:
-            changed = True
-    _standards_mtimes.clear()
-    _standards_mtimes.update(current)
+
+    changed = current != previous
+    _standards_mtimes[key] = current
     return changed
 
 
+def _any_standards_changed() -> bool:
+    """Report whether any watched standards directory changed since the last check.
+
+    Every watched directory is scanned before the results are reduced. A
+    short-circuiting any() would skip the remaining directories once one
+    reported a change, leaving their mtime baselines stale and making them
+    report a spurious change on the following call.
+
+    Returns:
+        True when at least one watched directory changed.
+    """
+    return any([_check_standards_changed(d) for d in _get_watched_dirs()])
+
+
 def _get_watched_dirs():
-    """Get list of directories to watch for standards changes."""
+    """Get the list of existing directories to watch for standards changes.
+
+    Returns:
+        List of Paths that currently exist on disk. Unresolved or missing
+        directories are skipped so the watcher never schedules a dead path.
+    """
     dirs = []
-    for d in [POLICIES_DIR, ARCH_STANDARDS_DIR, TEAM_STANDARDS_DIR, TEAM_STANDARDS_ALT]:
-        if d.exists():
+    for d in [RULES_DIR, POLICIES_DIR, ARCH_STANDARDS_DIR,
+              TEAM_STANDARDS_DIR, TEAM_STANDARDS_ALT]:
+        if d is not None and d.exists() and d not in dirs:
             dirs.append(d)
     return dirs
 
@@ -700,9 +891,16 @@ def _start_file_watcher():
         return {"status": "error", "error": str(e)[:100]}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
-def reload_standards(project_path: str = ".", start_watcher: bool = True) -> str:
+def reload_standards(
+    project_path: Annotated[str, Field(
+        description="Filesystem path to the project root to inspect. Defaults to the current working directory.")] = ".",
+    start_watcher: Annotated[bool, Field(
+        description="Start a background watchdog observer that invalidates the cache when a standards .md file changes. Requires the watchdog package; falls back to TTL-based caching when unavailable.")] = True,
+) -> str:
     """Reload standards by invalidating cache and optionally starting file watcher.
 
     Invalidates the cached standards so next load_standards call fetches fresh data.
@@ -714,14 +912,8 @@ def reload_standards(project_path: str = ".", start_watcher: bool = True) -> str
         start_watcher: If True, start file watcher for auto-reload
     """
     try:
-        import time
-
         # Check if any files actually changed before doing full reload
-        dirs_changed = any(
-            _check_standards_changed(d)
-            for d in _get_watched_dirs()
-            if Path(d).exists()
-        )
+        dirs_changed = _any_standards_changed()
 
         # If no changes and cache is fresh, return cached result
         cache_key = str(Path(project_path).resolve())
