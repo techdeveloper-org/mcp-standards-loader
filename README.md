@@ -2,7 +2,7 @@
 
 ![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![License MIT](https://img.shields.io/badge/License-MIT-green)
-![Part of claude-workflow-engine](https://img.shields.io/badge/Part%20of-claude--workflow--engine-blueviolet)
+![Part of ai-native-sdlc-engine](https://img.shields.io/badge/Part%20of-claude--workflow--engine-blueviolet)
 
 A FastMCP server that provides dynamic coding standards loading, project and framework detection, and priority-based conflict resolution for Claude Code workflows. Standards are loaded at runtime from up to four sources — custom, team, framework, and language — with higher-priority sources automatically winning any rule conflicts. A built-in 5-minute TTL cache with file-modification-based invalidation and optional `watchdog`-backed hot-reload ensures that changes to your `rules/` or `policies/` directories are picked up without restarting the server.
 
@@ -288,7 +288,7 @@ Response when changes are detected and `watchdog` is available:
   "watcher": {
     "status": "started",
     "watching": [
-      "/workspace/claude-workflow-engine/policies",
+      "/workspace/ai-native-sdlc-engine/policies",
       "/home/user/.claude/policies/02-standards-system"
     ]
   },
@@ -381,4 +381,4 @@ MIT License. See [LICENSE](LICENSE) for full terms.
 
 ---
 
-**Part of the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem — 13 MCP servers, 295 tools, LangGraph orchestration.**
+**Part of the [Claude Workflow Engine](https://github.com/techdeveloper-org/ai-native-sdlc-engine) ecosystem — 13 MCP servers, 295 tools, LangGraph orchestration.**
